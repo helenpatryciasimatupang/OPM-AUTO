@@ -1,0 +1,14 @@
+body{
+font-family:Arial;
+background:#f3f3f3;
+}
+.box{
+background:white;
+max-width:500px;
+margin:50px auto;
+padding:30px;
+}
+input,button{
+display:block;
+margin:15px 0;
+}
