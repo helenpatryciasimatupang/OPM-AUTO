@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OPM GO V15</title>
+<style>
+body{font-family:Arial,sans-serif;background:#f3f3f3;margin:0}
+.box{max-width:680px;margin:40px auto;background:#fff;padding:28px;border-radius:10px;box-shadow:0 2px 12px rgba(0,0,0,.08)}
+h2{margin-top:0}
+label{display:block;margin-top:16px;margin-bottom:6px;font-weight:700}
+input{display:block;width:100%;box-sizing:border-box}
+button{margin-top:20px;padding:11px 20px;font-size:16px;cursor:pointer}
+#status{white-space:pre-wrap;line-height:1.5;background:#f7f7f7;padding:12px;border-radius:6px;margin-top:18px}
+#download{display:none;margin-top:14px;font-weight:700}
+.small{font-size:13px;color:#666}
+</style>
+</head>
+<body>
+<div class="box">
+<h2>OPM GO V15</h2>
+<div class="small">Dynamic header + valid XLSX image injection</div>
+
+<label>Template Excel Kosong</label>
+<input id="excel" type="file" accept=".xlsx">
+
+<label>ZIP Foto Area</label>
+<input id="zip" type="file" accept=".zip">
+
+<button id="generateBtn" type="button">GENERATE</button>
+
+<div id="status">READY</div>
+<a id="download">DOWNLOAD RESULT</a>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script>
+(function(){
+const statusEl=document.getElementById("status");
+const downloadEl=document.getElementById("download");
+const btn=document.getElementById("generateBtn");
+
+function setStatus(s){ statusEl.textContent=s; }
+
+function norm(s){
+  return String(s||"").toUpperCase().replace(/[^A-Z0-9]/g,"");
+}
+function baseNoExt(path){
+  return path.split("/").pop().replace(/\.(jpg|jpeg|png)$/i,"");
+}
+function lettersToCol(letters){
+  let n=0;
+  for(const ch of letters.toUpperCase()) n=n*26+(ch.charCodeAt(0)-64);
+  return n;
+}
+function parseXml(text){
+  const doc=new DOMParser().parseFromString(text,"application/xml");
+  if(doc.getElementsByTagName("parsererror").length) throw new Error("XML template tidak valid.");
+  return doc;
+}
+function serializeXml(doc){
+  return new XMLSerializer().serializeToString(doc);
+}
+function localEls(node,name){
+  return node.getElementsByTagNameNS("*",name);
+}
+function getDirectChildByLocal(node,name){
+  for(const ch of node.children || []) if(ch.localName===name) return ch;
+  return null;
+}
+function getCellMap(sheetDoc, sharedStrings){
+  const map=new Map();
+  const cells=localEls(sheetDoc,"c");
+  for(const c of cells){
+    const ref=c.getAttribute("r");
+    if(!ref) continue;
+    let value="";
+    const t=c.getAttribute("t");
+    if(t==="inlineStr"){
+      const ts=localEls(c,"t");
+      value=Array.from(ts).map(x=>x.textContent||"").join("");
+    }else{
+      const v=localEls(c,"v")[0];
+      if(v){
+        const raw=v.textContent||"";
+        if(t==="s"){
+          const idx=Number(raw);
+          value=sharedStrings[idx] ?? "";
+        }else value=raw;
+      }
+    }
+    map.set(ref,value);
+  }
+  return map;
+}
+function parseSharedStrings(text){
+  if(!text) return [];
+  const doc=parseXml(text);
+  return Array.from(localEls(doc,"si")).map(si =>
+    Array.from(localEls(si,"t")).map(t=>t.textContent||"").join("")
+  );
+}
+function getSheetPath(workbookXml, workbookRelsXml){
+  const wdoc=parseXml(workbookXml);
+  let targetRid=null;
+  for(const s of Array.from(localEls(wdoc,"sheet"))){
+    const name=(s.getAttribute("name")||"").trim().replace(/\s+/g," ").toUpperCase();
+    if(name==="OPM FDT & FAT"){
+      targetRid=s.getAttributeNS("http://schemas.openxmlformats.org/officeDocument/2006/relationships","id")
+        || s.getAttribute("r:id");
+      break;
+    }
+  }
+  if(!targetRid) throw new Error('Sheet "OPM FDT & FAT" tidak ditemukan.');
+
+  const rdoc=parseXml(workbookRelsXml);
+  let target=null;
+  for(const r of Array.from(localEls(rdoc,"Relationship"))){
+    if(r.getAttribute("Id")===targetRid){ target=r.getAttribute("Target"); break; }
+  }
+  if(!target) throw new Error("Relasi sheet OPM tidak ditemukan.");
+  target=target.replace(/^\/+/,"");
+  if(target.startsWith("xl/")) return target;
+  return "xl/"+target;
+}
+function makeRelsPath(sheetPath){
+  const parts=sheetPath.split("/");
+  const file=parts.pop();
+  return parts.join("/")+"/_rels/"+file+".rels";
+}
+function getCategory(path){
+  const p=path.toUpperCase();
+  if(p.includes("/GRAFIK ONT TEST/")) return "ONT";
+  if(p.includes("/OPM FDT/")) return "OPM_FDT";
+  if(p.includes("/OPM FAT/")) return "OPM_FAT";
+  if(p.includes("/POLE/")) return "POLE";
+  if(p.includes("/FDT/")) return "FDT";
+  if(p.includes("/FAT/")) return "FAT";
+  if(p.includes("/SPLITTER/")) return "SPLITTER";
+  return null;
+}
+function exactPhoto(photos,cat,code){
+  const nc=norm(code);
+  let arr=photos.filter(p=>p.cat===cat && p.norm.includes(nc));
+  arr.sort((a,b)=>{
+    const ae=a.norm.endsWith(nc)?0:1, be=b.norm.endsWith(nc)?0:1;
+    return ae-be || a.norm.length-b.norm.length || a.path.localeCompare(b.path);
+  });
+  return arr[0]||null;
+}
+function opmFdtPhoto(photos,kind,fdt,splitter){
+  const nf=norm(fdt);
+  let arr=photos.filter(p=>p.cat==="OPM_FDT" && p.norm.includes(nf) && p.base.includes(kind.toUpperCase()));
+  if(splitter){
+    const sp=splitter.toUpperCase();
+    const filtered=arr.filter(p=>p.base.replace(/\s+/g,"").includes(sp));
+    if(filtered.length) arr=filtered;
+  }
+  arr.sort((a,b)=>a.path.localeCompare(b.path));
+  return arr[0]||null;
+}
+function findNextDrawingIndex(files){
+  let max=0;
+  for(const n of files){
+    const m=n.match(/^xl\/drawings\/drawing(\d+)\.xml$/i);
+    if(m) max=Math.max(max,Number(m[1]));
+  }
+  return max+1;
+}
+function escXml(s){
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+btn.addEventListener("click", async function(){
+  downloadEl.style.display="none";
+  try{
+    if(typeof JSZip==="undefined") throw new Error("JSZip gagal dimuat. Refresh halaman.");
+    const excel=document.getElementById("excel").files[0];
+    const zipFile=document.getElementById("zip").files[0];
+    if(!excel||!zipFile) throw new Error("Pilih Template Excel dan ZIP Foto Area.");
+
+    setStatus("1/7 Membaca template Excel...");
+    const xlsx=await JSZip.loadAsync(await excel.arrayBuffer());
+
+    setStatus("2/7 Membaca ZIP foto...");
+    const photoZip=await JSZip.loadAsync(await zipFile.arrayBuffer());
+
+    const photos=[];
+    for(const [path,entry] of Object.entries(photoZip.files)){
+      if(entry.dir || !/\.(jpg|jpeg|png)$/i.test(path)) continue;
+      const cat=getCategory(path);
+      if(!cat) continue;
+      const base=baseNoExt(path).toUpperCase();
+      photos.push({
+        path, entry, cat, base,
+        norm:norm(base),
+        ext:path.toLowerCase().endsWith(".png")?"png":"jpeg"
+      });
+    }
+    if(!photos.length) throw new Error("Tidak ada foto JPG/JPEG/PNG yang terbaca di ZIP.");
+
+    setStatus("3/7 Membaca header Excel...");
+    const workbookXml=await xlsx.file("xl/workbook.xml").async("string");
+    const workbookRelsXml=await xlsx.file("xl/_rels/workbook.xml.rels").async("string");
+    const sheetPath=getSheetPath(workbookXml,workbookRelsXml);
+    const sheetRelsPath=makeRelsPath(sheetPath);
+    const sheetXml=await xlsx.file(sheetPath).async("string");
+    const sharedText=xlsx.file("xl/sharedStrings.xml") ? await xlsx.file("xl/sharedStrings.xml").async("string") : "";
+    const sharedStrings=parseSharedStrings(sharedText);
+    const sheetDoc=parseXml(sheetXml);
+    const cellMap=getCellMap(sheetDoc,sharedStrings);
+
+    const fdt=String(cellMap.get("B10")||"").trim().toUpperCase();
+    if(!fdt) throw new Error("Kode FDT di B10 tidak ditemukan.");
+
+    const headers=[];
+    for(const [ref,value] of cellMap.entries()){
+      const m=ref.match(/^([A-Z]+)10$/);
+      if(!m) continue;
+      const col=lettersToCol(m[1]);
+      const code=String(value||"").trim().toUpperCase();
+      if(col>=4 && /^FC[A-Z0-9]+S\d+[A-Z]\d+$/i.test(code)) headers.push({col,code});
+    }
+    headers.sort((a,b)=>a.col-b.col);
+    if(!headers.length) throw new Error("Header FAT pada row 10 tidak ditemukan.");
+
+    setStatus("4/7 Mapping gambar...\nFDT: "+fdt+"\nFAT header: "+headers.length);
+    const targets=[];
+    const missing=[];
+
+    function addTarget(col,row,photo,label){
+      if(photo) targets.push({col,row,photo,label});
+      else missing.push(label);
+    }
+
+    addTarget(2,11,exactPhoto(photos,"POLE",fdt),"B11 POLE FDT");
+    addTarget(2,12,exactPhoto(photos,"FDT",fdt),"B12 FDT");
+
+    const inputFdt=opmFdtPhoto(photos,"INPUT",fdt,null);
+    let chosenSplitter=null;
+    if(inputFdt){
+      const m=inputFdt.base.replace(/\s+/g,"").match(/S\d+/);
+      if(m) chosenSplitter=m[0];
+    }
+    addTarget(2,13,inputFdt,"B13 OPM FDT INPUT");
+    addTarget(2,15,opmFdtPhoto(photos,"OUTPUT",fdt,chosenSplitter),"B15 OPM FDT OUTPUT");
+
+    for(const h of headers){
+      addTarget(h.col,11,exactPhoto(photos,"POLE",h.code),h.code+" POLE");
+      addTarget(h.col,12,exactPhoto(photos,"FAT",h.code),h.code+" FAT");
+
+      const sm=h.code.match(/(S\d+)/i);
+      const splitter=sm?sm[1].toUpperCase():null;
+      addTarget(h.col,13,opmFdtPhoto(photos,"OUTPUT",fdt,splitter),h.code+" OPM FDT OUTPUT");
+
+      const opmFat=exactPhoto(photos,"OPM_FAT",h.code);
+      addTarget(h.col,15,opmFat,h.code+" OPM FAT");
+      addTarget(h.col,17,opmFat,h.code+" ONT RESULT");
+      addTarget(h.col,20,exactPhoto(photos,"ONT",h.code),h.code+" ONT REMOTE");
+    }
+
+    if(!targets.length) throw new Error("Mapping gambar tidak menghasilkan target apa pun.");
+
+    setStatus("5/7 Menyisipkan "+targets.length+" gambar...");
+    const unique=[];
+    const uniqueMap=new Map();
+    for(const t of targets){
+      if(!uniqueMap.has(t.photo.path)){
+        const idx=unique.length+1;
+        uniqueMap.set(t.photo.path,idx);
+        unique.push(t.photo);
+      }
+    }
+
+    for(let i=0;i<unique.length;i++){
+      const p=unique[i];
+      const data=await p.entry.async("arraybuffer");
+      xlsx.file(`xl/media/opmgo_${i+1}.${p.ext}`,data);
+    }
+
+    const drawingIndex=findNextDrawingIndex(Object.keys(xlsx.files));
+    const drawingName=`drawing${drawingIndex}.xml`;
+    const drawingPath=`xl/drawings/${drawingName}`;
+    const drawingRelsPath=`xl/drawings/_rels/${drawingName}.rels`;
+
+    let anchors="";
+    let picId=1;
+    for(const t of targets){
+      const rid=uniqueMap.get(t.photo.path);
+      const c0=t.col-1, r0=t.row-1;
+      anchors += `<xdr:twoCellAnchor editAs="oneCell">`+
+        `<xdr:from><xdr:col>${c0}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${r0}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>`+
+        `<xdr:to><xdr:col>${c0+1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${r0+1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>`+
+        `<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="${picId}" name="${escXml(t.label)}"/><xdr:cNvPicPr/></xdr:nvPicPr>`+
+        `<xdr:blipFill><a:blip r:embed="rId${rid}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>`+
+        `<xdr:spPr><a:xfrm/><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic>`+
+        `<xdr:clientData/></xdr:twoCellAnchor>`;
+      picId++;
+    }
+
+    const drawingXml=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`+
+      `<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" `+
+      `xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" `+
+      `xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">${anchors}</xdr:wsDr>`;
+    xlsx.file(drawingPath,drawingXml);
+
+    let drawingRels=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`+
+      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">`;
+    for(let i=0;i<unique.length;i++){
+      const p=unique[i];
+      drawingRels += `<Relationship Id="rId${i+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/opmgo_${i+1}.${p.ext}"/>`;
+    }
+    drawingRels += `</Relationships>`;
+    xlsx.file(drawingRelsPath,drawingRels);
+
+    let sheetRelsText=xlsx.file(sheetRelsPath) ? await xlsx.file(sheetRelsPath).async("string") :
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>`;
+    const relDoc=parseXml(sheetRelsText);
+    const relRoot=relDoc.documentElement;
+    let maxRid=0;
+    for(const r of Array.from(localEls(relDoc,"Relationship"))){
+      const m=(r.getAttribute("Id")||"").match(/^rId(\d+)$/);
+      if(m) maxRid=Math.max(maxRid,Number(m[1]));
+      const type=r.getAttribute("Type")||"";
+      if(type.endsWith("/drawing")) r.remove();
+    }
+    const sheetDrawingRid="rId"+(maxRid+1);
+    const relEl=relDoc.createElementNS("http://schemas.openxmlformats.org/package/2006/relationships","Relationship");
+    relEl.setAttribute("Id",sheetDrawingRid);
+    relEl.setAttribute("Type","http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing");
+    relEl.setAttribute("Target",`../drawings/${drawingName}`);
+    relRoot.appendChild(relEl);
+    xlsx.file(sheetRelsPath,serializeXml(relDoc));
+
+    for(const d of Array.from(localEls(sheetDoc,"drawing"))) d.remove();
+    const drawingEl=sheetDoc.createElementNS("http://schemas.openxmlformats.org/spreadsheetml/2006/main","drawing");
+    drawingEl.setAttributeNS("http://schemas.openxmlformats.org/officeDocument/2006/relationships","r:id",sheetDrawingRid);
+    sheetDoc.documentElement.appendChild(drawingEl);
+    xlsx.file(sheetPath,serializeXml(sheetDoc));
+
+    let ctText=await xlsx.file("[Content_Types].xml").async("string");
+    const ctDoc=parseXml(ctText);
+    const ctRoot=ctDoc.documentElement;
+    const defaults=Array.from(localEls(ctDoc,"Default"));
+    if(!defaults.some(x=>(x.getAttribute("Extension")||"").toLowerCase()==="jpeg")){
+      const e=ctDoc.createElementNS("http://schemas.openxmlformats.org/package/2006/content-types","Default");
+      e.setAttribute("Extension","jpeg"); e.setAttribute("ContentType","image/jpeg"); ctRoot.insertBefore(e,ctRoot.firstChild);
+    }
+    if(!defaults.some(x=>(x.getAttribute("Extension")||"").toLowerCase()==="jpg")){
+      const e=ctDoc.createElementNS("http://schemas.openxmlformats.org/package/2006/content-types","Default");
+      e.setAttribute("Extension","jpg"); e.setAttribute("ContentType","image/jpeg"); ctRoot.insertBefore(e,ctRoot.firstChild);
+    }
+    const partName="/"+drawingPath;
+    if(!Array.from(localEls(ctDoc,"Override")).some(x=>x.getAttribute("PartName")===partName)){
+      const o=ctDoc.createElementNS("http://schemas.openxmlformats.org/package/2006/content-types","Override");
+      o.setAttribute("PartName",partName);
+      o.setAttribute("ContentType","application/vnd.openxmlformats-officedocument.drawing+xml");
+      ctRoot.appendChild(o);
+    }
+    xlsx.file("[Content_Types].xml",serializeXml(ctDoc));
+
+    setStatus("6/7 Membuat XLSX...");
+    const blob=await xlsx.generateAsync({
+      type:"blob",
+      compression:"DEFLATE",
+      mimeType:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    });
+
+    const old=downloadEl.dataset.url;
+    if(old) URL.revokeObjectURL(old);
+    const url=URL.createObjectURL(blob);
+    downloadEl.dataset.url=url;
+    downloadEl.href=url;
+    downloadEl.download="OPM_RESULT_V15.xlsx";
+    downloadEl.style.display="inline-block";
+    downloadEl.textContent="DOWNLOAD RESULT";
+
+    setStatus(
+      "7/7 SELESAI\n"+
+      "FDT: "+fdt+"\n"+
+      "Header FAT: "+headers.length+"\n"+
+      "Gambar terpasang: "+targets.length+"\n"+
+      "File gambar unik: "+unique.length+"\n"+
+      "Tidak ditemukan: "+missing.length+
+      (missing.length ? "\n\nContoh missing:\n- "+missing.slice(0,8).join("\n- ") : "")
+    );
+  }catch(err){
+    console.error(err);
+    setStatus("ERROR: "+(err && err.message ? err.message : String(err)));
+  }
+});
+})();
+</script>
+</body>
+</html>
